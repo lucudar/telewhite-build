@@ -384,7 +384,8 @@ jobs:
               ['git', '-C', root, 'ls-files', '-s', '-z', '--recurse-submodules'],
               capture_output=True, check=True).stdout.decode('utf-8')
           stamp = 1577836800 # 2020-01-01, older than anything in the build cache.
-          same = changed = 0
+          same = 0
+          changed = []
           for entry in listing.split('\0'):
               if not entry:
                   continue
@@ -395,8 +396,15 @@ jobs:
                   os.utime(full, (stamp, stamp))
                   same += 1
               else:
-                  changed += 1
-          print(f'Unchanged since the cached build: {same}, changed or new: {changed}.')
+                  changed.append(path)
+          line = f'Unchanged since the cached build: {same}, changed or new: {len(changed)}.'
+          print(line)
+          for path in changed:
+              print('  ' + path)
+          # The list of rebuilt sources, readable without signing in.
+          shown = [line] + changed[:50] + (['...'] if len(changed) > 50 else [])
+          text = '\n'.join(shown).replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+          print(f'::notice title=Build cache sources::{text}')
 
       # Logs need sign-in, annotations do not: turn compiler and linker
       # errors into annotations of the run.
@@ -420,7 +428,7 @@ jobs:
                 "owner": "telewhite-link",
                 "pattern": [
                   {
-                    "regexp": "^([^(]*?\\s*:\\s+(?:Command line\\s+)?(?:fatal\\s+)?(error|warning)\\s+((?:LNK|D|U|RC|CVT)\\d+)\\s*:.*)$",
+                    "regexp": "^(\\s*\\S.*?\\s+:\\s+(?:Command line\\s+)?(?:fatal\\s+)?(error|warning)\\s+((?:LNK|D|U|RC|CVT)\\d+)\\s*:.*)$",
                     "message": 1, "severity": 2, "code": 3
                   }
                 ]
@@ -457,7 +465,39 @@ jobs:
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF ^
           %TDESKTOP_BUILD_DEFINE%
 
-          cmake --build ..\out --config Release --parallel -- -k 0
+          cmake --build ..\out --config Release --parallel -- -k 0 > %TBUILD%\telewhite-build.log 2>&1
+          set BUILD_EXIT=%ERRORLEVEL%
+          type %TBUILD%\telewhite-build.log
+          exit /b %BUILD_EXIT%
+
+      # Problem matchers keep at most 10 errors per step, and the linker
+      # lists the missing symbols on lines they may skip: show the error
+      # lines of the build log as annotations, they need no sign-in.
+      - name: Build errors.
+        if: failure() && steps.build.outcome == 'failure'
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:TBUILD 'telewhite-build.log'
+          if (!(Test-Path $log)) {
+            Write-Output 'No build log.'
+            exit 0
+          }
+          # Decorated names like (?Name@@YAXXZ) only repeat the readable ones.
+          $lines = @(Get-Content $log |
+            Where-Object { $_ -match '^FAILED: |: (fatal )?error |unresolved external|CMake Error' } |
+            ForEach-Object { $_ -replace ' \(\?\S*\)', '' } |
+            ForEach-Object { if ($_.Length -gt 1200) { $_.Substring(0, 1200) + ' ...' } else { $_ } } |
+            Select-Object -Unique |
+            Select-Object -First 27)
+          $index = 0
+          for ($i = 0; $i -lt $lines.Count; $i += 3) {
+            $index++
+            $chunk = ($lines[$i..([Math]::Min($i + 2, $lines.Count - 1))] -join "`n")
+            $chunk = $chunk.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Build errors ${index}::$chunk"
+            if ($index -ge 9) { break }
+          }
+          Write-Output "Error lines: $($lines.Count)"
 
       - name: Move artifact.
         if: (env.UPLOAD_ARTIFACT == 'true') || (github.ref == 'refs/heads/nightly')
