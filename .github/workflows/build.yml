@@ -22,13 +22,18 @@ jobs:
   windows:
     name: Windows
     timeout-minutes: 360
+    permissions:
+      contents: read
+      actions: write
     runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
 
     strategy:
       matrix:
         arch: [x64]
         qt: [""]
-        generator: [""]
+        # Ninja gives every file its own subset of lang keys, so adding
+        # strings rebuilds only the files that use them (with the build cache).
+        generator: ["Ninja Multi-Config"]
 
     env:
       UPLOAD_ARTIFACT: "true"
@@ -273,7 +278,6 @@ jobs:
           if [ -n "${{ matrix.generator }}" ]; then
             GENERATOR="-G \"${{ matrix.generator }}\""
             echo "Generator from matrix: $GENERATOR"
-            ARTIFACT_NAME="${ARTIFACT_NAME} ${{ matrix.generator }}"
           fi
           echo "TDESKTOP_BUILD_GENERATOR=$GENERATOR" >> $GITHUB_ENV
 
@@ -348,7 +352,95 @@ jobs:
           maximum-size: 32GB
           disk-root: 'D:'
 
+      # Build cache: the out folder of the previous successful build. Sources
+      # that did not change since that build get an old timestamp, so Ninja
+      # rebuilds only the changed files and the files that depend on them.
+      - name: Build cache.
+        id: cache-build
+        if: env.ONLY_CACHE == 'false'
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}\out
+          key: ${{ runner.OS }}-${{ matrix.arch }}-build-ninja-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ${{ runner.OS }}-${{ matrix.arch }}-build-ninja-${{ env.CACHE_KEY }}-
+
+      - name: Source timestamps for the build cache.
+        if: env.ONLY_CACHE == 'false' && steps.cache-build.outputs.cache-matched-key != ''
+        shell: python
+        run: |
+          import os, subprocess
+          root = os.path.join(os.environ['TBUILD'], os.environ['REPO_NAME'])
+          manifest = os.path.join(root, 'out', 'telewhite-sources.txt')
+          if not os.path.isfile(manifest):
+              print('No sources list in the build cache, full build.')
+              raise SystemExit(0)
+          old = {}
+          with open(manifest, encoding='utf-8') as f:
+              for line in f:
+                  sha, _, path = line.rstrip('\n').partition(' ')
+                  if path:
+                      old[path] = sha
+          listing = subprocess.run(
+              ['git', '-C', root, 'ls-files', '-s', '-z', '--recurse-submodules'],
+              capture_output=True, check=True).stdout.decode('utf-8')
+          stamp = 1577836800 # 2020-01-01, older than anything in the build cache.
+          same = changed = 0
+          for entry in listing.split('\0'):
+              if not entry:
+                  continue
+              meta, _, path = entry.partition('\t')
+              sha = meta.split(' ')[1]
+              full = os.path.join(root, path)
+              if old.get(path) == sha and os.path.isfile(full) and not os.path.islink(full):
+                  os.utime(full, (stamp, stamp))
+                  same += 1
+              else:
+                  changed += 1
+          print(f'Unchanged since the cached build: {same}, changed or new: {changed}.')
+
+      # Logs need sign-in, annotations do not: turn compiler and linker
+      # errors into annotations of the run.
+      - name: Problem matcher.
+        if: env.ONLY_CACHE == 'false'
+        shell: bash
+        run: |
+          cat > "$RUNNER_TEMP/telewhite-matcher.json" << 'EOF'
+          {
+            "problemMatcher": [
+              {
+                "owner": "telewhite-msvc",
+                "pattern": [
+                  {
+                    "regexp": "^((?:\\s*\\d+>)?([^\\s].*?)\\((\\d+)(?:,\\s*(\\d+))?\\)\\s*:\\s+(?:fatal\\s+)?(error|warning)\\s*([A-Za-z]*\\d+)?\\s*:.*)$",
+                    "message": 1, "file": 2, "line": 3, "column": 4, "severity": 5, "code": 6
+                  }
+                ]
+              },
+              {
+                "owner": "telewhite-link",
+                "pattern": [
+                  {
+                    "regexp": "^([^(]*?\\s*:\\s+(?:Command line\\s+)?(?:fatal\\s+)?(error|warning)\\s+((?:LNK|D|U|RC|CVT)\\d+)\\s*:.*)$",
+                    "message": 1, "severity": 2, "code": 3
+                  }
+                ]
+              },
+              {
+                "owner": "telewhite-cmake",
+                "pattern": [
+                  {
+                    "regexp": "^(CMake Error.*)$",
+                    "message": 1
+                  }
+                ]
+              }
+            ]
+          }
+          EOF
+          echo "::add-matcher::$RUNNER_TEMP/telewhite-matcher.json"
+
       - name: Telegram Desktop build.
+        id: build
         if: env.ONLY_CACHE == 'false'
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
@@ -365,7 +457,7 @@ jobs:
           -D DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF ^
           %TDESKTOP_BUILD_DEFINE%
 
-          cmake --build ..\out --config Release --parallel
+          cmake --build ..\out --config Release --parallel -- -k 0
 
       - name: Move artifact.
         if: (env.UPLOAD_ARTIFACT == 'true') || (github.ref == 'refs/heads/nightly')
@@ -381,3 +473,54 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: artifact\
           retention-days: 7
+
+      # Keep the out folder after a successful build, and after a failed
+      # build without a restored cache: then every object in it was built
+      # from these sources, so the next run compiles only what is left.
+      - name: Build cache size.
+        id: out-size
+        if: (success() || failure()) && env.ONLY_CACHE == 'false' && (steps.build.outcome == 'success' || (steps.build.outcome == 'failure' && steps.cache-build.outputs.cache-matched-key == ''))
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:TBUILD "$env:REPO_NAME\out"
+          $size = (Get-ChildItem $out -Recurse -File -Force | Measure-Object Length -Sum).Sum / 1GB
+          $line = 'Build folder: {0:N1} GB' -f $size
+          Write-Output "::notice title=Build cache::$line"
+          $line >> $env:GITHUB_STEP_SUMMARY
+          "big=$([int]($size -gt 20))" >> $env:GITHUB_OUTPUT
+
+      # Drop the previous build cache first: the 10 GB cache limit evicts the
+      # least recently used entries, and those may be the library caches.
+      - name: Drop the previous build cache.
+        if: (success() || failure()) && steps.build.outcome == 'success' && steps.cache-build.outputs.cache-matched-key != '' && steps.cache-build.outputs.cache-matched-key != steps.cache-build.outputs.cache-primary-key
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh cache delete "${{ steps.cache-build.outputs.cache-matched-key }}" --repo "$GITHUB_REPOSITORY" || echo "Could not delete the previous build cache."
+
+      - name: Remember sources for the build cache.
+        id: sources
+        if: (success() || failure()) && env.ONLY_CACHE == 'false' && (steps.build.outcome == 'success' || (steps.build.outcome == 'failure' && steps.cache-build.outputs.cache-matched-key == '')) && steps.out-size.outputs.big == '0'
+        shell: python
+        run: |
+          import os, subprocess
+          root = os.path.join(os.environ['TBUILD'], os.environ['REPO_NAME'])
+          listing = subprocess.run(
+              ['git', '-C', root, 'ls-files', '-s', '-z', '--recurse-submodules'],
+              capture_output=True, check=True).stdout.decode('utf-8')
+          count = 0
+          with open(os.path.join(root, 'out', 'telewhite-sources.txt'), 'w', encoding='utf-8', newline='\n') as f:
+              for entry in listing.split('\0'):
+                  if not entry:
+                      continue
+                  meta, _, path = entry.partition('\t')
+                  f.write(meta.split(' ')[1] + ' ' + path + '\n')
+                  count += 1
+          print(f'Remembered {count} sources.')
+
+      - name: Save build cache.
+        if: (success() || failure()) && steps.sources.outcome == 'success'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}\out
+          key: ${{ steps.cache-build.outputs.cache-primary-key }}
