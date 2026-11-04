@@ -487,7 +487,8 @@ jobs:
           $line = 'Build folder: {0:N1} GB' -f $size
           Write-Output "::notice title=Build cache::$line"
           $line >> $env:GITHUB_STEP_SUMMARY
-          "big=$([int]($size -gt 20))" >> $env:GITHUB_OUTPUT
+          # 19 GB on disk took 1.6 GB in the cache (run 41850726014).
+          "big=$([int]($size -gt 30))" >> $env:GITHUB_OUTPUT
 
       # Drop the previous build cache first: the 10 GB cache limit evicts the
       # least recently used entries, and those may be the library caches.
