@@ -365,7 +365,11 @@ jobs:
         with:
           path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}\out
           key: ${{ runner.OS }}-${{ matrix.arch }}-build-ninja-${{ env.CACHE_KEY }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ${{ runner.OS }}-${{ matrix.arch }}-build-ninja-${{ env.CACHE_KEY }}-
+          # The second key: after an upstream update prepare.py and CACHE_KEY change,
+          # but most object files are still valid, Ninja rebuilds only the changed ones.
+          restore-keys: |
+            ${{ runner.OS }}-${{ matrix.arch }}-build-ninja-${{ env.CACHE_KEY }}-
+            ${{ runner.OS }}-${{ matrix.arch }}-build-ninja-
 
       - name: Source timestamps for the build cache.
         if: env.ONLY_CACHE == 'false' && steps.cache-build.outputs.cache-matched-key != ''
