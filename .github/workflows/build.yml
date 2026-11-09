@@ -23,7 +23,7 @@ jobs:
     name: Windows
     timeout-minutes: 360
     permissions:
-      contents: read
+      contents: write
       actions: write
     runs-on: ${{ matrix.arch == 'arm64' && 'windows-11-arm' || 'windows-latest' }}
 
@@ -520,6 +520,20 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: artifact\
           retention-days: 7
+
+      # The same build as a public release "latest": install.ps1 downloads it
+      # without the browser "downloaded from the internet" mark.
+      - name: Publish release.
+        if: env.UPLOAD_ARTIFACT == 'true'
+        continue-on-error: true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          Compress-Archive -Path artifact\* -DestinationPath Telewhite-x64.zip -Force
+          $notes = "$env:ARTIFACT_NAME`n`nУстановка и обновление: см. README репозитория."
+          gh release delete latest --repo $env:GITHUB_REPOSITORY --cleanup-tag --yes 2>$null
+          gh release create latest Telewhite-x64.zip --repo $env:GITHUB_REPOSITORY --title "$env:ARTIFACT_NAME" --notes $notes --target $env:GITHUB_SHA --latest
 
       # Keep the out folder after a successful build, and after a failed
       # build without a restored cache: then every object in it was built
